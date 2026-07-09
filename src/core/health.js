@@ -290,10 +290,13 @@ function _copyMsixPackageLocal(tvPath, { cpSync, rmSync, readdirSync, existsSync
 const MSIX_LAUNCHER_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'scripts', 'launch_msix.ps1');
 
 // Get the MSIX app's AUMID (needed for COM activation) via Get-AppxPackage.
+// Select-Object -First 1 guards against multiple TradingView.Desktop packages
+// (e.g. mid-update leftovers) returning an array → multi-line output; the extra
+// split('\n')[0] is defense-in-depth so a stray newline can't corrupt the AUMID.
 function _findMsixAumid({ execSync }) {
   try {
-    const ps = 'powershell -NoProfile -Command "(Get-AppxPackage -Name \'TradingView.Desktop\' -ErrorAction SilentlyContinue).PackageFamilyName"';
-    const pfn = execSync(ps, { timeout: 5000 }).toString().trim();
+    const ps = 'powershell -NoProfile -Command "(Get-AppxPackage -Name \'TradingView.Desktop\' -ErrorAction SilentlyContinue | Select-Object -First 1).PackageFamilyName"';
+    const pfn = execSync(ps, { timeout: 5000 }).toString().trim().split('\n')[0].trim();
     return pfn ? `${pfn}!TradingView.Desktop` : null;
   } catch { return null; }
 }
