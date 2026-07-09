@@ -5,6 +5,7 @@ import { getClient, getTargetInfo, evaluate, CDP_HOST, CDP_PORT } from '../conne
 import { existsSync, cpSync, rmSync, readdirSync } from 'fs';
 import { execSync, spawn } from 'child_process';
 import { dirname, basename, join } from 'path';
+import { fileURLToPath } from 'url';
 
 // Best-effort git-pull update check: compare local HEAD to origin's default
 // branch on GitHub. Never throws — returns null on any failure (offline,
@@ -283,6 +284,30 @@ function _copyMsixPackageLocal(tvPath, { cpSync, rmSync, readdirSync, existsSync
   return dstExe;
 }
 
+// Decision B (fork, Codex finding 4/5): our MSIX COM-activation launcher, re-ported
+// into upstream's launch(). Tried BEFORE upstream's WindowsApps-spawn/local-copy
+// because IApplicationActivationManager is empirically verified on this machine.
+const MSIX_LAUNCHER_SCRIPT = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'scripts', 'launch_msix.ps1');
+
+// Get the MSIX app's AUMID (needed for COM activation) via Get-AppxPackage.
+function _findMsixAumid({ execSync }) {
+  try {
+    const ps = 'powershell -NoProfile -Command "(Get-AppxPackage -Name \'TradingView.Desktop\' -ErrorAction SilentlyContinue).PackageFamilyName"';
+    const pfn = execSync(ps, { timeout: 5000 }).toString().trim();
+    return pfn ? `${pfn}!TradingView.Desktop` : null;
+  } catch { return null; }
+}
+
+// Launch via IApplicationActivationManager COM API (scripts/launch_msix.ps1).
+// Returns { pid } on success; throws on failure so the caller can fall through.
+function _launchMsixCom({ aumid, port, execSync }) {
+  const cmd = `powershell -NoProfile -ExecutionPolicy Bypass -File "${MSIX_LAUNCHER_SCRIPT}" -Aumid "${aumid}" -Port ${port}`;
+  const out = execSync(cmd, { timeout: 15000, windowsHide: true }).toString().trim();
+  const result = JSON.parse(out);
+  if (!result.success) throw new Error(`MSIX COM launch failed: ${result.error || 'unknown'}`);
+  return { pid: result.pid };
+}
+
 export async function launch({ port, kill_existing, _deps } = {}) {
   const deps = _resolveLaunchDeps(_deps);
   const cdpPort = port || CDP_PORT;
@@ -360,24 +385,54 @@ export async function launch({ port, kill_existing, _deps } = {}) {
   if (killFirst) await killExisting();
 
   const cdpArgs = [`--remote-debugging-port=${cdpPort}`];
-  let child = _spawnDetached(deps.spawn, tvPath, cdpArgs);
+  const isMsix = platform === 'win32' && WINDOWS_APPS_RE.test(tvPath);
+  let child = null;
   let info = null;
   let usedLocalCopy = false;
+  let usedCom = false;
+  let comStarted = false; // COM actually launched a process (has a pid)
+  let comError = null;
+  let launchMethod = 'native';
 
-  if (platform === 'win32' && WINDOWS_APPS_RE.test(tvPath)) {
-    const earlyFailure = await _spawnFailedEarly(child);
-    if (!earlyFailure) {
-      info = await _waitForCdp({ cdpPort, attempts: 15, delay: deps.delay, probeCdp: deps.probeCdp });
+  if (isMsix) {
+    // Decision B: try our COM activation first (verified on this machine).
+    const aumid = _findMsixAumid(deps);
+    if (aumid) {
+      try {
+        const res = _launchMsixCom({ aumid, port: cdpPort, execSync: deps.execSync });
+        child = { pid: res.pid };
+        comStarted = true;
+        info = await _waitForCdp({ cdpPort, attempts: 15, delay: deps.delay, probeCdp: deps.probeCdp });
+        if (info) { launchMethod = 'msix'; usedCom = true; }
+      } catch (e) { comError = e.message; /* fall through to upstream spawn/local-copy */ }
     }
+
+    // COM unavailable or CDP never bound → upstream WindowsApps-spawn + local-copy.
     if (!info) {
-      // Direct WindowsApps launch was blocked or CDP never bound — fall back to
-      // a local copy of the package (see _copyMsixPackageLocal).
-      const localExe = _copyMsixPackageLocal(tvPath, deps);
-      await killExisting();
-      child = _spawnDetached(deps.spawn, localExe, cdpArgs);
-      tvPath = localExe;
-      usedLocalCopy = true;
+      // Only clean up if COM actually started an instance — a COM failure that
+      // launched nothing must not kill the user's existing TradingView when
+      // kill_existing was false.
+      if (comStarted) await killExisting();
+      child = _spawnDetached(deps.spawn, tvPath, cdpArgs);
+      const earlyFailure = await _spawnFailedEarly(child);
+      if (!earlyFailure) {
+        info = await _waitForCdp({ cdpPort, attempts: 15, delay: deps.delay, probeCdp: deps.probeCdp });
+      }
+      if (info) {
+        launchMethod = 'msix';
+      } else {
+        // Direct WindowsApps launch blocked or CDP never bound — local copy.
+        const localExe = _copyMsixPackageLocal(tvPath, deps);
+        await killExisting();
+        child = _spawnDetached(deps.spawn, localExe, cdpArgs);
+        tvPath = localExe;
+        usedLocalCopy = true;
+        launchMethod = 'msix-local-copy';
+      }
     }
+  } else {
+    // Non-MSIX native path.
+    child = _spawnDetached(deps.spawn, tvPath, cdpArgs);
   }
 
   if (!info) {
@@ -386,16 +441,20 @@ export async function launch({ port, kill_existing, _deps } = {}) {
 
   if (info) {
     return {
-      success: true, platform, binary: tvPath, pid: child.pid,
+      success: true, platform, launch_method: launchMethod, binary: tvPath, pid: child.pid,
       cdp_port: cdpPort, cdp_url: `http://${CDP_HOST}:${cdpPort}`,
       browser: info.Browser, user_agent: info['User-Agent'],
+      ...(usedCom && { msix_com: true }),
       ...(usedLocalCopy && { msix_local_copy: true }),
     };
   }
 
   return {
-    success: true, platform, binary: tvPath, pid: child.pid, cdp_port: cdpPort, cdp_ready: false,
+    success: true, platform, launch_method: launchMethod, binary: tvPath, pid: child.pid,
+    cdp_port: cdpPort, cdp_ready: false,
     ...(usedLocalCopy && { msix_local_copy: true }),
-    warning: 'TradingView launched but CDP not responding yet. It may still be loading. Try tv_health_check in a few seconds.',
+    ...(comError && { com_error: comError }),
+    warning: 'TradingView launched but CDP not responding yet. It may still be loading. Try tv_health_check in a few seconds.'
+      + (comError ? ` (COM launch attempt failed: ${comError})` : ''),
   };
 }
