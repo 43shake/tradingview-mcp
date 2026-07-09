@@ -292,7 +292,7 @@ export async function compile() {
       var saveBtn = null;
       for (var i = 0; i < btns.length; i++) {
         var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
+        if (/save and add to chart|儲存並(增加|新增|加入)到圖表|保存并(添加|加入|增加)到图表/i.test(text)) {
           btns[i].click();
           return 'Save and add to chart';
         }
@@ -448,12 +448,12 @@ export async function smartCompile() {
       var saveBtn = null;
       for (var i = 0; i < btns.length; i++) {
         var text = btns[i].textContent.trim();
-        if (/save and add to chart/i.test(text)) {
+        if (/save and add to chart|儲存並(增加|新增|加入)到圖表|保存并(添加|加入|增加)到图表/i.test(text)) {
           btns[i].click();
           return 'Save and add to chart';
         }
-        if (!addBtn && /^add to chart$/i.test(text)) addBtn = btns[i];
-        if (!updateBtn && /^update on chart$/i.test(text)) updateBtn = btns[i];
+        if (!addBtn && /^(add to chart|新增到圖表|添加到圖表|加入圖表)/i.test(text)) addBtn = btns[i];
+        if (!updateBtn && /^(update on chart|更新圖表|更新於圖表)/i.test(text)) updateBtn = btns[i];
         if (!saveBtn && btns[i].className.indexOf('saveButton') !== -1 && btns[i].offsetParent !== null) saveBtn = btns[i];
       }
       if (addBtn) { addBtn.click(); return 'Add to chart'; }
