@@ -3,11 +3,14 @@ import { jsonResult } from './_format.js';
 import * as core from '../core/data.js';
 
 export function registerDataTools(server) {
-  server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart. Use summary=true for compact stats instead of all bars (saves context).', {
-    count: z.coerce.number().optional().describe('Number of bars to retrieve (max 500, default 100)'),
+  server.tool('data_get_ohlcv', 'Get OHLCV bar data from the chart. Tail mode (count) returns the latest bars; range mode (from/to) returns a historical window, auto-paging history back as needed. Use summary=true for compact stats instead of all bars (saves context).', {
+    count: z.coerce.number().optional().describe('Tail mode: number of latest bars to retrieve (max 500, default 100). Mutually exclusive with from/to.'),
     summary: z.coerce.boolean().optional().describe('Return summary stats (high, low, open, close, avg volume, range) instead of all bars — much smaller output'),
-  }, async ({ count, summary }) => {
-    try { return jsonResult(await core.getOhlcv({ count, summary })); }
+    from: z.coerce.string().optional().describe('Range mode: start time — unix seconds or ISO datetime. Bare dates ("2026-07-13") parse as UTC midnight; for session-local windows pass an explicit offset ("2026-07-13T08:45:00+08:00"). Auto-pages history back (~1000 bars/round, max 25 rounds).'),
+    to: z.coerce.string().optional().describe('Range mode: end time (same formats as from). Omit for "up to the latest bar".'),
+    lookback_bars: z.coerce.number().optional().describe('Range mode: extra bars to include before `from` (MA warmup, e.g. 60 for MA60). Default 0.'),
+  }, async ({ count, summary, from, to, lookback_bars }) => {
+    try { return jsonResult(await core.getOhlcv({ count, summary, from, to, lookback_bars })); }
     catch (err) { return jsonResult({ success: false, error: err.message }, true); }
   });
 

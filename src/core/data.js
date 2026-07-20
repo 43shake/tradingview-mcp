@@ -134,11 +134,70 @@ function buildGraphicsJS(collectionName, mapKey, filter) {
   `;
 }
 
-export async function getOhlcv({ count, summary } = {}) {
+const RANGE_PAGE_ROUNDS = 25;
+const RANGE_PAGE_WAIT_MS = 1800;
+
+// Accepts unix seconds or anything Date.parse understands. Bare dates
+// ("2026-07-13") parse as UTC midnight — for session-local windows pass an
+// explicit offset ("2026-07-13T08:45:00+08:00"). Digit-only strings below 1e8
+// (~1973) are rejected: they are never chart-era unix seconds, and "2026"
+// would otherwise be silently read as seconds instead of a year.
+function parseRangeTs(value, name) {
+  if (value == null) return null;
+  const s = String(value).trim();
+  let ts;
+  if (/^\d+$/.test(s)) {
+    ts = Number(s);
+    if (ts < 1e8 || !Number.isFinite(ts)) {
+      throw new Error(`${name} "${value}" is not usable as unix seconds — pass unix seconds >= 1e8 or an ISO datetime (e.g. 2026-07-13T08:45:00+08:00).`);
+    }
+  } else {
+    ts = Math.floor(new Date(s).getTime() / 1000);
+  }
+  if (!Number.isFinite(ts)) throw new Error(`Could not parse ${name}: ${value}. Use unix seconds or an ISO datetime (e.g. 2026-07-13T08:45:00+08:00).`);
+  return ts;
+}
+
+function summarize(bars) {
+  const highs = bars.map(b => b.high);
+  const lows = bars.map(b => b.low);
+  const volumes = bars.map(b => b.volume);
+  const first = bars[0];
+  const last = bars[bars.length - 1];
+  return {
+    success: true, bar_count: bars.length,
+    period: { from: first.time, to: last.time },
+    open: first.open, close: last.close,
+    high: Math.max(...highs), low: Math.min(...lows),
+    range: roundPrice(Math.max(...highs) - Math.min(...lows)),
+    change: roundPrice(last.close - first.open),
+    change_pct: Math.round(((last.close - first.open) / first.open) * 10000) / 100 + '%',
+    avg_volume: Math.round(volumes.reduce((a, b) => a + b, 0) / volumes.length),
+    last_5_bars: bars.slice(-5),
+  };
+}
+
+export async function getOhlcv({ count, summary, from, to, lookback_bars, _deps } = {}) {
+  const ev = (_deps && _deps.evaluate) || evaluate;
+  const fromTs = parseRangeTs(from, 'from');
+  const toTs = parseRangeTs(to, 'to');
+  if (fromTs == null && toTs != null) throw new Error('`to` requires `from`.');
+  if (fromTs == null && lookback_bars != null) throw new Error('`lookback_bars` requires `from`.');
+
+  if (fromTs != null) {
+    if (count != null) throw new Error('Use either `count` (tail mode) or `from`/`to` (range mode), not both.');
+    if (toTs != null && toTs < fromTs) throw new Error('`to` must not be earlier than `from`.');
+    const lookback = lookback_bars == null ? 0 : lookback_bars;
+    if (!Number.isInteger(lookback) || lookback < 0 || lookback > MAX_OHLCV_BARS) {
+      throw new Error(`lookback_bars must be an integer between 0 and ${MAX_OHLCV_BARS}, got ${lookback_bars}.`);
+    }
+    return getOhlcvRange({ fromTs, toTs, lookback, summary, ev, _deps });
+  }
+
   const limit = Math.min(count || 100, MAX_OHLCV_BARS);
   let data;
   try {
-    data = await evaluate(`
+    data = await ev(`
       (function() {
         var bars = ${BARS_PATH};
         if (!bars || typeof bars.lastIndex !== 'function') return null;
@@ -158,27 +217,122 @@ export async function getOhlcv({ count, summary } = {}) {
     throw new Error('Could not extract OHLCV data. The chart may still be loading.');
   }
 
-  if (summary) {
-    const bars = data.bars;
-    const highs = bars.map(b => b.high);
-    const lows = bars.map(b => b.low);
-    const volumes = bars.map(b => b.volume);
-    const first = bars[0];
-    const last = bars[bars.length - 1];
-    return {
-      success: true, bar_count: bars.length,
-      period: { from: first.time, to: last.time },
-      open: first.open, close: last.close,
-      high: Math.max(...highs), low: Math.min(...lows),
-      range: roundPrice(Math.max(...highs) - Math.min(...lows)),
-      change: roundPrice(last.close - first.open),
-      change_pct: Math.round(((last.close - first.open) / first.open) * 10000) / 100 + '%',
-      avg_volume: Math.round(volumes.reduce((a, b) => a + b, 0) / volumes.length),
-      last_5_bars: bars.slice(-5),
-    };
-  }
+  if (summary) return summarize(data.bars);
 
   return { success: true, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, bars: data.bars };
+}
+
+// Range mode: return bars whose time falls in [fromTs, toTs] (toTs null = up to
+// the latest bar), plus up to `lookback` bars immediately before the first match
+// (MA warmup for renderers). The chart lazy-loads ~300 bars, so history is paged
+// back via requestMoreData — same pacing as setVisibleRange in core/chart.js.
+//
+// Each round runs ONE merged strictly-ascending scan that returns the slice AND
+// the coverage state ({before, more, buf_first}) from the same snapshot:
+// - valueAt() keeps an internal cursor and returns wrong bars when indices are
+//   revisited out of order near a page seam (observed live: a backward jump
+//   after a full scan came back offset by +6), so indices are never revisited —
+//   the lookback window is a sliding tail collected during the forward pass.
+// - While a page merges in, the buffer can transiently hold bars out of time
+//   order (seen live on TXF1! — lookback picked in-range bars); the scan
+//   reports an `ordered` flag and the round is retried, then fails loud rather
+//   than returning a silently-wrong window.
+async function getOhlcvRange({ fromTs, toTs, lookback, summary, ev, _deps }) {
+  const maxRounds = (_deps && _deps.maxRounds) || RANGE_PAGE_ROUNDS;
+  const waitMs = (_deps && _deps.pageWaitMs != null) ? _deps.pageWaitMs : RANGE_PAGE_WAIT_MS;
+
+  const scanJs = `(function() {
+    var bars = ${BARS_PATH};
+    if (!bars || typeof bars.lastIndex !== 'function') return null;
+    var ms = ${CHART_API}._chartWidget.model().mainSeries();
+    var more = true; try { more = ms.requestMoreDataAvailable(); } catch (e) {}
+    var start = bars.firstIndex(), end = bars.lastIndex();
+    var toCond = ${toTs == null ? 'null' : toTs};
+    var inRange = 0, before = 0, matched = false, result = [], pre = [];
+    var ordered = true, prevT = null, fvT = null;
+    for (var i = start; i <= end; i++) {
+      var v = bars.valueAt(i);
+      if (!v) continue;
+      if (fvT == null) fvT = v[0];
+      if (prevT != null && v[0] <= prevT) ordered = false;
+      prevT = v[0];
+      if (v[0] < ${fromTs}) before++;
+      if (v[0] >= ${fromTs} && (toCond === null || v[0] <= toCond)) {
+        inRange++;
+        matched = true;
+        if (result.length < ${MAX_OHLCV_BARS}) result.push({time: v[0], open: v[1], high: v[2], low: v[3], close: v[4], volume: v[5] || 0});
+      } else if (!matched && v[0] < ${fromTs} && ${lookback} > 0) {
+        pre.push({time: v[0], open: v[1], high: v[2], low: v[3], close: v[4], volume: v[5] || 0});
+        if (pre.length > ${lookback}) pre.shift();
+      }
+    }
+    return { bars: pre.concat(result), in_range: inRange, lookback_included: pre.length,
+             before: before, more: more, total_bars: bars.size(), buf_first: fvT,
+             ordered: ordered, source: 'direct_bars_range' };
+  })()`;
+
+  const scanOnce = async () => {
+    let data = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try { data = await ev(scanJs); } catch { data = null; }
+      if (data && data.ordered !== false) break;
+      if (attempt < 2) await new Promise((r) => setTimeout(r, waitMs || 1000));
+    }
+    if (!data) throw new Error('Could not extract OHLCV data. The chart may still be loading.');
+    if (data.ordered === false) {
+      throw new Error('Chart buffer is unordered (history page still merging) — wait a moment and retry.');
+    }
+    return data;
+  };
+
+  let data = await scanOnce();
+  let rounds = 0;
+  for (;;) {
+    const covered = data.buf_first != null && data.buf_first <= fromTs;
+    if ((covered && data.before >= lookback) || !data.more) break;
+    if (rounds >= maxRounds) {
+      throw new Error(`Hit the ${maxRounds}-page paging round cap before history reached the requested range start — loaded bars are kept, so call again to continue paging, or narrow the range.`);
+    }
+    const prevFirst = data.buf_first, prevSize = data.total_bars;
+    await ev(`(function() { try { ${CHART_API}._chartWidget.model().mainSeries().requestMoreData(1000); } catch (e) {} })()`);
+    rounds++;
+    await new Promise((r) => setTimeout(r, waitMs));
+    data = await scanOnce();
+    // A page can land slower than one wait interval. Before declaring the feed
+    // stuck, settle-poll WITHOUT firing more page requests; only an idle streak
+    // across all polls counts as a stall (round-1 stall detection double-fired
+    // pages and false-failed after two fixed sleeps).
+    if (data.buf_first === prevFirst && data.total_bars === prevSize) {
+      let settled = false;
+      for (let poll = 0; poll < 3; poll++) {
+        await new Promise((r) => setTimeout(r, waitMs));
+        data = await scanOnce();
+        if (data.buf_first !== prevFirst || data.total_bars !== prevSize || !data.more) { settled = true; break; }
+      }
+      if (!settled) {
+        throw new Error('History paging is not advancing (buffer unchanged across settle polls) — the feed may be stuck; retry later or narrow the range.');
+      }
+    }
+  }
+
+  if (data.in_range === 0) {
+    throw new Error(`No bars in range ${fromTs}..${toTs == null ? 'latest' : toTs} on the current chart — check symbol/timeframe and that the range covers trading sessions.`);
+  }
+  if (data.in_range + data.lookback_included > MAX_OHLCV_BARS) {
+    throw new Error(`Range matches ${data.in_range} bars (+${data.lookback_included} lookback), over the ${MAX_OHLCV_BARS}-bar cap — narrow the range or fetch in slices.`);
+  }
+
+  // Key is `window`, not `range` — summarize() already returns a price-range
+  // field named `range` and must not be clobbered.
+  const window = {
+    from: fromTs, to: toTs == null ? null : toTs,
+    in_range: data.in_range, lookback_requested: lookback, lookback_included: data.lookback_included,
+    range_start_covered: data.buf_first != null && data.buf_first <= fromTs,
+  };
+  // Summary must describe the requested window only — warmup bars would poison
+  // open/change/high/low (fresh review F1); they stay in the non-summary bars.
+  if (summary) return { ...summarize(data.bars.slice(data.lookback_included)), window };
+  return { success: true, bar_count: data.bars.length, total_available: data.total_bars, source: data.source, window, bars: data.bars };
 }
 
 export async function getIndicator({ entity_id }) {

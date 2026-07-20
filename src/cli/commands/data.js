@@ -11,10 +11,16 @@ register('ohlcv', {
   options: {
     count: { type: 'string', short: 'n', description: 'Number of bars (default 100, max 500)' },
     summary: { type: 'boolean', short: 's', description: 'Return summary stats instead of all bars' },
+    from: { type: 'string', description: 'Range mode start (unix seconds or ISO datetime)' },
+    to: { type: 'string', description: 'Range mode end (unix seconds or ISO datetime)' },
+    lookback: { type: 'string', description: 'Extra bars before `from` (MA warmup)' },
   },
   handler: (opts) => core.getOhlcv({
     count: opts.count ? Number(opts.count) : undefined,
     summary: opts.summary,
+    from: opts.from,
+    to: opts.to,
+    lookback_bars: opts.lookback ? Number(opts.lookback) : undefined,
   }),
 });
 

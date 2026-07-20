@@ -24,6 +24,16 @@ Use `study_filter` parameter to target a specific indicator by name substring (e
 - `data_get_ohlcv` without summary → all bars (use `count` to limit, default 100)
 - `quote_get` → single latest price snapshot
 
+### "Give me a HISTORICAL window" (range mode)
+- `data_get_ohlcv` with `from`/`to` (unix seconds or ISO datetime) → bars inside that window, auto-paging chart history back as needed (~1000 bars per round, 25-round cap; loaded history persists on the chart, so re-calling continues where it stopped)
+- `lookback_bars: 60` → also include the 60 bars immediately before `from` (MA warmup for renderers); they are prepended to `bars` but excluded from `summary` stats
+- Result metadata lives under `window`: `in_range` / `lookback_included` / `range_start_covered` (false = the feed genuinely ran out before reaching `from`)
+- Gotchas (all fail loud instead of returning silently-wrong data):
+  - Bare dates ("2026-07-13") parse as **UTC midnight** — for Taiwan sessions pass an explicit offset ("2026-07-13T08:45:00+08:00"). Same UTC trap is why `replay_start(date)` appears to stop one trading day early (it stops just before UTC midnight of that date) — pass D+1 to replay through day D.
+  - Ranges matching > 500 bars throw — narrow the window or fetch in slices.
+  - "buffer is unordered" → a history page was still merging; wait a moment and retry.
+  - Do NOT fetch historical ranges via replay mode; range mode makes replay unnecessary for data extraction.
+
 ### "Analyze my chart" (full report workflow)
 1. `quote_get` → current price
 2. `data_get_study_values` → all indicator readings
