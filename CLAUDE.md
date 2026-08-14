@@ -1,6 +1,6 @@
 # TradingView MCP — Claude Instructions
 
-68 tools for reading and controlling a live TradingView Desktop chart via CDP (port 9222).
+Tools for reading and controlling a live TradingView Desktop chart via CDP (port 9222). For the current tool count, count `server.tool(` registrations under `src/` — do not hardcode it here (the previously hardcoded "68" had drifted; actual count at 2026-08-14 was 78).
 
 ## Decision Tree — Which Tool When
 
